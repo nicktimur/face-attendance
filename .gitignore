@@ -1,0 +1,12 @@
+__pycache__
+/__pycache__
+venv
+/.venv
+venv-cpu
+/.venv-cpu
+venv-cuda
+/.venv-cuda
+working_face_recognizer/additional_data_for_exe/20180402-114759-vggface2.pt
+/Yoklama Kayıtları
+/Yoklama Raporları
+/working_face_recognizer/new_dataset/Tanınmayan Yüzler
