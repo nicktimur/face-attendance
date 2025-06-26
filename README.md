@@ -61,22 +61,19 @@ face-recognizer/
 │   ├── gui.ui
 │   ├── main.py
 │   ├── UI.py
-├── working_face_recognizer/
+├── face_recognizer/
 │   ├── facenet_live_recognition.py
 │   ├── gui.ui
 │   ├── main.py
 │   ├── recognition_thread.py
 │   ├── UI.py
-│   ├── additional_data_for_exe/
-│   ├── new_dataset/
+│   ├── dataset/
 │   │   ├── 12345/
 │   │   │   ├── photo1.jpg
 │   │   │   ├── photo2.jpg
 │   │   ├── 67890/
 │   │       ├── photo1.jpg
 │   │       ├── photo2.jpg
-│   ├── old_dataset/
-│   ├── venv-cpu/
 ├── README.md
 ├── requirements.txt
 ```
