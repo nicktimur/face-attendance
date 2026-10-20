@@ -1,6 +1,6 @@
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QPushButton
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QPushButton, QSizePolicy
 from threading import Lock
 import sys
 import cv2
@@ -28,8 +28,10 @@ class MacCameraWindow(QWidget):
         self.setMinimumSize(320, 240)
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setText("Kamera ve yüz tanıma modeli hazırlanıyor…")
         self.image_label.setMinimumSize(1, 1)
-        self.image_label.setStyleSheet("background: black;")
+        self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.image_label.setStyleSheet("background: black; color: white;")
         self.stop_button = QPushButton("Kamerayı durdur (Q / Esc)")
         self.stop_button.clicked.connect(self.close)
         layout = QVBoxLayout(self)
@@ -149,18 +151,21 @@ class RecognitionThread(QThread):
         image = QImage(
             rgb.data, width, height, rgb.strides[0], QImage.Format_RGB888
         ).copy()
+        if not self._camera_window.isVisible():
+            self._camera_window.show()
+        self._camera_window.layout().activate()
         self._camera_window.image_label.setPixmap(QPixmap.fromImage(image).scaled(
             self._camera_window.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         ))
-        if not self._camera_window.isVisible():
-            self._camera_window.show()
-            self._camera_window.raise_()
-            self._camera_window.activateWindow()
-            self._camera_window.setFocus(Qt.OtherFocusReason)
 
     def _start_preview(self):
         if not self.isInterruptionRequested():
             self._camera_window.start_listening()
+            self._camera_window.show()
+            self._camera_window.layout().activate()
+            self._camera_window.raise_()
+            self._camera_window.activateWindow()
+            self._camera_window.setFocus(Qt.OtherFocusReason)
             self._preview_timer.start()
 
     def _stop_preview(self):

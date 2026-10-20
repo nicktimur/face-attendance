@@ -1,5 +1,7 @@
 import cv2
 import sys
+import time
+from pathlib import Path
 from threading import Event
 import numpy as np
 import os
@@ -11,7 +13,7 @@ from PyQt5 import QtGui
 from facenet_pytorch import InceptionResnetV1, MTCNN
 from scipy.spatial.distance import cosine
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 class FacenetRecognizer():
 
@@ -21,7 +23,24 @@ class FacenetRecognizer():
         self.camera_id = camera_id
         self.threshold = 1 - (threshold/100)
         self.database_path = database_path
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif sys.platform == "darwin" and torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+        # MTCNN'nin değişken boyutlu işlemleri için Mac'te CPU kullanılır.
+        self.detector_device = "cpu" if self.device == "mps" else self.device
+        self.detection_width = 640
+        self._resnet = None
+        self._visual_tracks = []
+        self._overlay_fonts = {}
+        self.overlay_hold_seconds = 0.45
+        self._face_transform = transforms.Compose([
+            transforms.Resize((160, 160)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
         self.status = "waiting"
         self.log_callback = log_callback
         self.attendance_callback = attendance_callback
@@ -37,6 +56,125 @@ class FacenetRecognizer():
     def log(self, message):
         if self.log_callback:
             self.log_callback(message)
+
+    @staticmethod
+    def _box_iou(a, b):
+        x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+        x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+        overlap = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+        area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        return overlap / max(area_a + area_b - overlap, 1)
+
+    def _update_visual_tracks(self, observations, now):
+        # Bu takip yalnızca çizim içindir; eski kutular yoklama sayacına girmez.
+        old = [track for track in self._visual_tracks
+               if now - track["seen"] <= self.overlay_hold_seconds]
+        unused = set(range(len(old)))
+        updated = []
+        for box, identity, similarity in observations:
+            match = max(unused, key=lambda i: self._box_iou(box, old[i]["box"]),
+                        default=None)
+            if match is not None and self._box_iou(box, old[match]["box"]) >= 0.25:
+                previous = old[match]
+                unused.remove(match)
+                box = 0.65 * np.asarray(box) + 0.35 * previous["box"]
+                if identity == previous["identity"]:
+                    similarity = 0.65 * similarity + 0.35 * previous["similarity"]
+            updated.append(dict(box=np.asarray(box, dtype=float), identity=identity,
+                                similarity=similarity, seen=now, missed=0))
+        for index in unused:
+            track = dict(old[index])
+            track["missed"] += 1
+            if track["missed"] <= 2:
+                updated.append(track)
+        self._visual_tracks = updated
+        return updated
+
+    def _overlay_font(self, size):
+        if size not in self._overlay_fonts:
+            folder = Path(__file__).resolve().parent
+            candidates = [folder / "fonts/DejaVuSans.ttf",
+                          folder.parent / "fonts/DejaVuSans.ttf",
+                          Path.cwd() / "fonts/DejaVuSans.ttf",
+                          Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+                          Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/arial.ttf",
+                          "DejaVuSans.ttf"]
+            for candidate in candidates:
+                try:
+                    font = ImageFont.truetype(str(candidate), size)
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError("Türkçe yazılar için fonts/DejaVuSans.ttf bulunamadı.")
+            self._overlay_fonts[size] = font
+        return self._overlay_fonts[size]
+
+    def _draw_overlays(self, frame, tracks):
+        if not tracks:
+            return frame
+        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(image)
+        font_size = max(18, round(frame.shape[1] / 60))
+        font = self._overlay_font(font_size)
+        for track in tracks:
+            x1, y1, x2, y2 = (int(value) for value in track["box"])
+            color = (0, 255, 0) if track["identity"] != "Bilinmiyor" else (255, 80, 80)
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=2)
+            text = f'{track["identity"]} ({track["similarity"]:.2f}%)'
+            # Unicode TrueType fontu; OpenCV Hershey fontu kullanılmaz.
+            draw.text((max(0, x1), max(0, y1 - font_size - 8)), text,
+                      font=font, fill=color, stroke_width=1, stroke_fill=(0, 0, 0))
+        return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+
+    def _get_resnet(self):
+        if self._resnet is None:
+            model = InceptionResnetV1(pretrained="vggface2").eval()
+            try:
+                self._resnet = model.to(self.device)
+            except (RuntimeError, NotImplementedError) as exc:
+                if self.device != "mps":
+                    raise
+                self.log(f"MPS başlatılamadı; yüz tanıma CPU'ya geçti: {exc}")
+                self.device = "cpu"
+                self._resnet = model.to("cpu")
+        return self._resnet
+
+    def _embedding(self, face_tensor):
+        model = self._get_resnet()
+        with torch.inference_mode():
+            try:
+                output = model(face_tensor.to(self.device))
+                # MPS sonuçlarının CPU'ya aktarımı da hata verebilir.
+                return output.cpu().numpy().flatten()
+            except (RuntimeError, NotImplementedError) as exc:
+                if self.device != "mps":
+                    raise
+                self.log(f"MPS işlemi desteklenmedi; yüz tanıma CPU'ya geçti: {exc}")
+                self.device = "cpu"
+                self._resnet = model.to("cpu")
+                return self._resnet(face_tensor.to("cpu")).cpu().numpy().flatten()
+
+    def _detect_faces(self, detector, frame):
+        # Orijinal kare değişmez; sadece algılayıcının girdisi küçültülür.
+        height, width = frame.shape[:2]
+        target_width = min(width, self.detection_width)
+        target_height = max(1, round(height * target_width / width))
+        if target_width < width:
+            small = cv2.resize(frame, (target_width, target_height),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        with torch.inference_mode():
+            boxes, _ = detector.detect(rgb)
+        if boxes is None:
+            return None
+        boxes = np.asarray(boxes, dtype=np.float64).copy()
+        boxes[:, [0, 2]] *= width / target_width
+        boxes[:, [1, 3]] *= height / target_height
+        return boxes
 
     # Cosine Distance hesaplayan fonksiyon
     def cosine_distance(self, vec1, vec2):
@@ -75,8 +213,8 @@ class FacenetRecognizer():
 
         print("Veritabanı oluşturuluyor...")
         self.log("Veritabanı oluşturuluyor... Bu işlem zaman alabilir.")
-        mtcnn = MTCNN(keep_all=True, device=self.device)
-        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+        mtcnn = MTCNN(keep_all=True, device=self.detector_device)
+        self._get_resnet()
 
         try:
             for student_id in os.listdir(database_path):
@@ -96,6 +234,10 @@ class FacenetRecognizer():
                             file_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
                             img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
+                            if img is None:
+                                self.log("Görüntü yüklenemedi: " + image_path)
+                                continue
+
                             # Ekle: Griye çevir, histogram eşitleme ve tekrar BGR
                             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                             equalized = cv2.equalizeHist(gray)
@@ -113,12 +255,11 @@ class FacenetRecognizer():
                                 if aligned_faces.shape[0] > 1:
                                     self.log(f"HATALI: {image_file} birden fazla yüz içeriyor, atlanıyor.")
                                     continue  # Bu görüntüyü işleme
-                                aligned_face = aligned_faces[0].unsqueeze(0).to(self.device)
+                                aligned_face = aligned_faces[0].unsqueeze(0)
                             else:
-                                aligned_face = aligned_faces.unsqueeze(0).to(self.device)
+                                aligned_face = aligned_faces.unsqueeze(0)
 
-                            embedding_tensor = resnet(aligned_face)
-                            embedding = embedding_tensor.detach().cpu().numpy().flatten()
+                            embedding = self._embedding(aligned_face)
 
                             norm = np.linalg.norm(embedding)
                             if norm != 0:
@@ -164,125 +305,121 @@ class FacenetRecognizer():
             return None  # veya bir hata durumu işlenebilir
         
         try:
-            detector = MTCNN(keep_all=True, device=self.device)  # MTCNN yüz algılama modelini başlat
-            resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+            detector = MTCNN(keep_all=True, device=self.detector_device)  # MTCNN yüz algılama modelini başlat
+            self._get_resnet()
+            self.log(f"Yüz algılama: {self.detector_device}; yüz tanıma: {self.device}; algılama genişliği: {self.detection_width}px")
 
             while not self._stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                # MTCNN ile yüz koordinatlarını ve yüz görüntülerinin tensörlerini al
-                faces, _ = detector.detect(frame)
-                face_tensors = detector(frame)
+                # Her kare yalnızca kutular çizildikten sonra gönderilir.
+                # Ham + işlenmiş kareyi sırayla göndermek kutuları titreştirir.
+                faces = self._detect_faces(detector, frame)
+                observations = []
 
-                if faces is not None and face_tensors is not None:
-                    for i, face in enumerate(faces):
+                if faces is not None:
+                    for face in faces:
+                        if self._stop_event.is_set():
+                            break
+                        if not np.isfinite(face).all():
+                            continue
                         x1, y1, x2, y2 = face
 
-                        if i < len(face_tensors) and face_tensors[i] is not None:
-                            # Orijinal frame'den yüz crop'u al
-                            height, width = frame.shape[:2]
-                            x1 = int(max(0, min(x1, width)))
-                            x2 = int(max(0, min(x2, width)))
-                            y1 = int(max(0, min(y1, height)))
-                            y2 = int(max(0, min(y2, height)))
-                            face_crop = frame[y1:y2, x1:x2]
+                        # Orijinal frame'den yüz crop'u al
+                        height, width = frame.shape[:2]
+                        x1 = int(max(0, min(x1, width)))
+                        x2 = int(max(0, min(x2, width)))
+                        y1 = int(max(0, min(y1, height)))
+                        y2 = int(max(0, min(y2, height)))
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        face_crop = frame[y1:y2, x1:x2]
 
-                            # ✅ Sadece yüz crop'u normalize edilir
-                            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                            equalized = cv2.equalizeHist(gray)
-                            face_crop_gray = cv2.cvtColor(equalized, cv2.COLOR_GRAY2BGR)
+                        # ✅ Sadece yüz crop'u normalize edilir
+                        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                        equalized = cv2.equalizeHist(gray)
+                        face_crop_gray = cv2.cvtColor(equalized, cv2.COLOR_GRAY2BGR)
 
-                            face_pil = Image.fromarray(cv2.cvtColor(face_crop_gray, cv2.COLOR_BGR2RGB))
+                        face_pil = Image.fromarray(cv2.cvtColor(face_crop_gray, cv2.COLOR_BGR2RGB))
 
-                            # 3. Tensor ve Resize
-                            transform = transforms.Compose([
-                                transforms.Resize((160, 160)),
-                                transforms.ToTensor(),
-                                transforms.Normalize([0.5], [0.5])
-                            ])
+                        face_tensor = self._face_transform(face_pil).unsqueeze(0)
+                        embedding = self._embedding(face_tensor)
+                        norm = np.linalg.norm(embedding)
+                        if norm != 0:
+                            embedding = embedding / norm
 
-                            face_tensor = transform(face_pil).unsqueeze(0).to(self.device)
+                        # En yakın kişiyi bul
+                        min_distance = float('inf')
+                        identity = "Bilinmiyor"
 
-                            # Embedding çıkar
-                            embedding = resnet(face_tensor).detach().cpu().numpy().flatten()
-                            norm = np.linalg.norm(embedding)
-                            if norm != 0:
-                                embedding = embedding / norm
+                        for student_id, student_embeddings in self.database.items():
+                            for db_embedding in student_embeddings:
+                                dist = self.cosine_distance(embedding, db_embedding)
+                                if dist < min_distance:
+                                    min_distance = dist
+                                    identity = student_id
 
-                            # En yakın kişiyi bul
-                            min_distance = float('inf')
+                        if min_distance > self.threshold:
                             identity = "Bilinmiyor"
 
-                            for student_id, student_embeddings in self.database.items():
-                                for db_embedding in student_embeddings:
-                                    dist = self.cosine_distance(embedding, db_embedding)
-                                    if dist < min_distance:
-                                        min_distance = dist
-                                        identity = student_id
+                        if identity != "Bilinmiyor":
+                            info = self.attendance_log.get(identity, {"count": 0, "marked": False, "timestamp": None})
 
-                            if min_distance > self.threshold:
-                                identity = "Bilinmiyor"
+                            if not info["marked"]:
+                                info["count"] += 1
+                                if info["count"] >= self.detection_threshold:
+                                    info["marked"] = True
+                                    info["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    self.log(f"Yoklamaya katıldı: {identity} ({info['timestamp']})")
+                                    if self.attendance_callback:
+                                        self.attendance_callback(identity, info["timestamp"])
 
-                            if identity != "Bilinmiyor":
-                                info = self.attendance_log.get(identity, {"count": 0, "marked": False, "timestamp": None})
+                                    # ✅ Yüz görselini kaydet
+                                    if self.attendance_image_folder:
 
-                                if not info["marked"]:
-                                    info["count"] += 1
-                                    if info["count"] >= self.detection_threshold:
-                                        info["marked"] = True
-                                        info["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                        self.log(f"Yoklamaya katıldı: {identity} ({info['timestamp']})")
-                                        if self.attendance_callback:
-                                            self.attendance_callback(identity, info["timestamp"])
+                                        if x2 > x1 and y2 > y1:
+                                            # Türkçe karakter içeren dosya adı güvenli hale getirilir
+                                            img_filename = f"{identity}.jpg"
+                                            save_path = os.path.join(self.attendance_image_folder, img_filename)
 
-                                        # ✅ Yüz görselini kaydet
-                                        if self.attendance_image_folder:
-
-                                            if x2 > x1 and y2 > y1:
-                                                # Türkçe karakter içeren dosya adı güvenli hale getirilir
-                                                img_filename = f"{identity}.jpg"
-                                                save_path = os.path.join(self.attendance_image_folder, img_filename)
-
-                                                try:
-                                                    # Türkçe karakterli yola güvenli kayıt
-                                                    _, buffer = cv2.imencode(".jpg", face_crop)
-                                                    with open(save_path, 'wb') as f:
-                                                        f.write(buffer)
-                                                except Exception as e:
-                                                    self.log(f"❌ Hata oluştu, kayıt yapılamadı: {save_path}\n{e}")
-                                            else:
-                                                self.log(f"⚠️ Geçersiz yüz koordinatları: ({x1}, {y1}) - ({x2}, {y2})")
-
-                                else:
-                                    info["count"] = 0  # zaten işaretli, tekrar saymaya gerek yok
-
-                                self.attendance_log[identity] = info
+                                            try:
+                                                # Türkçe karakterli yola güvenli kayıt
+                                                _, buffer = cv2.imencode(".jpg", face_crop)
+                                                with open(save_path, 'wb') as f:
+                                                    f.write(buffer)
+                                            except Exception as e:
+                                                self.log(f"❌ Hata oluştu, kayıt yapılamadı: {save_path}\n{e}")
+                                        else:
+                                            self.log(f"⚠️ Geçersiz yüz koordinatları: ({x1}, {y1}) - ({x2}, {y2})")
 
                             else:
-                                self.unknown_face_count += 1
-                                if self.unknown_face_count >= self.unknown_save_threshold:
-                                    self.unknown_face_count = 0  # Sayacı sıfırla
-                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                    filename = f"unknown_{timestamp}.jpg"
-                                    save_path = os.path.join(self.unknown_faces_dir, filename)
-                                    try:
-                                        _, buffer = cv2.imencode(".jpg", face_crop)
-                                        with open(save_path, 'wb') as f:
-                                            f.write(buffer)
-                                    except Exception as e:
-                                        self.log(f"❌ Bilinmeyen yüz kaydedilemedi: {e}")
+                                info["count"] = 0  # zaten işaretli, tekrar saymaya gerek yok
 
-                            # Benzerlik yüzdesi hesapla
-                            similarity = self.similarity_percentage(min_distance)
+                            self.attendance_log[identity] = info
 
-                            # Yüzü kare içine al
-                            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                        else:
+                            self.unknown_face_count += 1
+                            if self.unknown_face_count >= self.unknown_save_threshold:
+                                self.unknown_face_count = 0  # Sayacı sıfırla
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filename = f"unknown_{timestamp}.jpg"
+                                save_path = os.path.join(self.unknown_faces_dir, filename)
+                                try:
+                                    _, buffer = cv2.imencode(".jpg", face_crop)
+                                    with open(save_path, 'wb') as f:
+                                        f.write(buffer)
+                                except Exception as e:
+                                    self.log(f"❌ Bilinmeyen yüz kaydedilemedi: {e}")
 
-                            # Tahmini yaz ve benzerlik yüzdesini göster
-                            cv2.putText(frame, f'{identity} ({similarity:.2f}%)', (int(x1), int(y1) - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0) if identity != "Bilinmiyor" else (0, 0, 255), 2)
+                        # Benzerlik yüzdesi hesapla
+                        similarity = self.similarity_percentage(min_distance)
+
+                        observations.append(((x1, y1, x2, y2), identity, similarity))
+
+                tracks = self._update_visual_tracks(observations, time.monotonic())
+                frame = self._draw_overlays(frame, tracks)
 
                 if sys.platform == "darwin":
                     self.frame_callback(frame)
