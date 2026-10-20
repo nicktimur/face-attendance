@@ -10,3 +10,7 @@ working_face_recognizer/additional_data_for_exe/20180402-114759-vggface2.pt
 /Yoklama Kayıtları
 /Yoklama Raporları
 /working_face_recognizer/new_dataset/Tanınmayan Yüzler
+/.vscode
+/new_dataset
+/new_dataset_with_names
+/old_dataset
